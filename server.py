@@ -15,10 +15,12 @@ app = Flask(__name__)
 @app.route("/send", methods=["POST"])
 def send_message():
     try:
-        data = request.get_json(force=True)
-        if not data:
-            return jsonify({"error": "No JSON received"}), 400
+        print(f"📥 Входящий запрос: {request.data}")  # 🔍 Отладка запроса
         
+        data = request.get_json(force=True, silent=True)  # silent=True, чтобы не падало на ошибке
+        if not data:
+            return jsonify({"error": "Invalid JSON"}), 400
+
         messages = data.get("messages", [])
         if not messages:
             return jsonify({"error": "No messages provided"}), 400
