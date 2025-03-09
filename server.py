@@ -13,28 +13,33 @@ client = TelegramClient("session_name", API_ID, API_HASH)
 app = Flask(__name__)
 
 @app.route("/send", methods=["POST"])
-async def send_message():
+def send_message():
     try:
-        data = request.get_json(force=True)  # ✅ Принудительное получение JSON
+        data = request.get_json(force=True)
         if not data:
             return jsonify({"error": "No JSON received"}), 400
         
         messages = data.get("messages", [])
         if not messages:
             return jsonify({"error": "No messages provided"}), 400
-        
-        async with client:
-            for msg in messages:
-                phone = msg.get("phone")
-                text = msg.get("message")
-                if not phone or not text:
-                    continue
-                
-                try:
-                    await client.send_message(phone, text)
-                    print(f"✅ Отправлено {phone}: {text}")
-                except Exception as e:
-                    print(f"❌ Ошибка при отправке {phone}: {e}")
+
+        async def send():
+            async with client:
+                for msg in messages:
+                    phone = msg.get("phone")
+                    text = msg.get("message")
+                    if not phone or not text:
+                        continue
+                    
+                    try:
+                        await client.send_message(phone, text)
+                        print(f"✅ Отправлено {phone}: {text}")
+                    except Exception as e:
+                        print(f"❌ Ошибка при отправке {phone}: {e}")
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(send())
 
         return jsonify({"status": "ok"})
 
