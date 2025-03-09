@@ -15,15 +15,22 @@ app = Flask(__name__)
 @app.route("/send", methods=["POST"])
 def send_message():
     try:
-        print(f"📥 Входящий запрос: {request.data}")  # 🔍 Отладка запроса
-        
-        data = request.get_json(force=True, silent=True)  # silent=True, чтобы не падало на ошибке
+        print(f"📥 Входящий запрос: {request.data}")
+
+        data = request.get_json(force=True, silent=True)
         if not data:
             return jsonify({"error": "Invalid JSON"}), 400
 
         messages = data.get("messages", [])
         if not messages:
             return jsonify({"error": "No messages provided"}), 400
+
+        # Подключаем клиента без запроса кода подтверждения
+        if not client.is_connected():
+            client.connect()
+
+        if not client.is_user_authorized():
+            return jsonify({"error": "Telethon не авторизован. Запусти `client.start()` вручную в локальном окружении и подтверди вход."}), 500
 
         async def send():
             async with client:
