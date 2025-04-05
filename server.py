@@ -7,10 +7,7 @@ API_HASH = "61bac300978d7a52ce2743969aa72332"
 PHONE_NUMBER = "+966542968297"
 
 client = TelegramClient("session_name", API_ID, API_HASH)
-
-# Глобальный event loop
 loop = asyncio.get_event_loop()
-
 app = Flask(__name__)
 
 @app.route("/send", methods=["POST"])
@@ -20,18 +17,19 @@ def send_message():
 
         data = request.get_json(force=True, silent=True)
         if not data:
-            return jsonify({"error": "Invalid JSON"}), 400
+            return jsonify({"status": "error", "reason": "Invalid JSON"}), 400
 
         messages = data.get("messages", [])
         if not messages:
-            return jsonify({"error": "No messages provided"}), 400
+            return jsonify({"status": "error", "reason": "No messages provided"}), 400
 
-        # Подключаем клиента, если он отключён
         if not client.is_connected():
             loop.run_until_complete(client.connect())
 
         if not client.is_user_authorized():
-            return jsonify({"error": "Telethon не авторизован"}), 500
+            return jsonify({"status": "error", "reason": "Telethon not authorized"}), 500
+
+        results = []
 
         async def send():
             async with client:
@@ -39,21 +37,35 @@ def send_message():
                     phone = msg.get("phone")
                     text = msg.get("message")
                     if not phone or not text:
+                        results.append({
+                            "phone": phone,
+                            "status": "error",
+                            "reason": "Missing phone or message"
+                        })
                         continue
 
                     try:
                         await client.send_message(phone, text)
-                        print(f"✅ Отправлено {phone}: {text}")
+                        print(f"✅ Отправлено {phone}")
+                        results.append({
+                            "phone": phone,
+                            "status": "ok"
+                        })
                     except Exception as e:
                         print(f"❌ Ошибка при отправке {phone}: {e}")
+                        results.append({
+                            "phone": phone,
+                            "status": "error",
+                            "reason": str(e)
+                        })
 
         loop.run_until_complete(send())
 
-        return jsonify({"status": "ok"})
+        return jsonify({"status": "partial", "results": results})
 
     except Exception as e:
         print(f"❌ Ошибка сервера: {e}")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"status": "error", "reason": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
