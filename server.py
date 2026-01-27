@@ -18,59 +18,89 @@ TG_SESSION = os.environ.get("TG_SESSION", "")
 if not TG_SESSION:
     raise RuntimeError("TG_SESSION is missing in env vars")
 
-client = TelegramClient(StringSession(TG_SESSION), API_ID, API_HASH)
-
-# --- ВАЖНО: loop должен крутиться постоянно ---
+# --- loop + client создаём в одном потоке ---
 _loop = asyncio.new_event_loop()
+_client = None
 
-def _run_loop_forever():
-    asyncio.set_event_loop(_loop)
-    _loop.run_forever()
-
-_thread = threading.Thread(target=_run_loop_forever, daemon=True)
-_thread.start()
+_ready = threading.Event()
+_init_error = {"err": None}
 
 
-async def _init_client():
-    await client.connect()
-    ok = await client.is_user_authorized()
+async def _async_init_client():
+    global _client
+    _client = TelegramClient(StringSession(TG_SESSION), API_ID, API_HASH)
+    await _client.connect()
+
+    ok = await _client.is_user_authorized()
     if not ok:
         raise RuntimeError("Telethon session is not authorized (TG_SESSION wrong/expired)")
+
     return True
 
-# инициализация клиента на работающем loop
-asyncio.run_coroutine_threadsafe(_init_client(), _loop).result(timeout=30)
+
+def _loop_thread():
+    asyncio.set_event_loop(_loop)
+    try:
+        _loop.run_until_complete(_async_init_client())
+        print("✅ Telethon client initialized")
+        _ready.set()
+        _loop.run_forever()
+    except Exception as e:
+        _init_error["err"] = str(e)
+        print("❌ Init error:", e)
+        _ready.set()
+
+
+threading.Thread(target=_loop_thread, daemon=True).start()
+
+# ждём инициализацию (при старте сервиса)
+_ready.wait(timeout=30)
+if _init_error["err"]:
+    raise RuntimeError("Telethon init failed: " + _init_error["err"])
 
 
 async def _resolve_entity_by_phone(phone: str):
-    phone_clean = phone.replace(" ", "")
-    contact = InputPhoneContact(
-        client_id=0,
-        phone=phone_clean,
-        first_name="Tmp",
-        last_name="Contact"
-    )
-    result = await client(ImportContactsRequest([contact]))
-    if result.users:
-        return result.users[0]
-    return None
+    # Жёсткий таймаут, чтобы Telethon не зависал
+    async def _do():
+        phone_clean = phone.replace(" ", "")
+        contact = InputPhoneContact(
+            client_id=0,
+            phone=phone_clean,
+            first_name="Tmp",
+            last_name="Contact"
+        )
+        result = await _client(ImportContactsRequest([contact]))
+        if result.users:
+            return result.users[0]
+        return None
+
+    return await asyncio.wait_for(_do(), timeout=12)
 
 
 async def _send_one(phone: str, text: str):
+    # 1) entity (таймаут)
     entity = await _resolve_entity_by_phone(phone)
     if not entity:
         return {
             "phone": phone,
             "status": "error",
-            "reason": "Telegram cannot resolve this phone (no TG / privacy / cannot message first)"
+            "reason": "Cannot resolve phone (user may not exist / privacy / not in Telegram)"
         }
 
+    # 2) send (таймаут)
+    async def _do_send():
+        await _client.send_message(entity, text)
+        return True
+
     try:
-        await client.send_message(entity, text)
+        await asyncio.wait_for(_do_send(), timeout=12)
         return {"phone": phone, "status": "ok"}
 
     except FloodWaitError as e:
         return {"phone": phone, "status": "flood_wait", "retry_after": int(e.seconds)}
+
+    except asyncio.TimeoutError:
+        return {"phone": phone, "status": "error", "reason": "telethon_send_timeout"}
 
     except Exception as e:
         return {"phone": phone, "status": "error", "reason": str(e)}
@@ -78,6 +108,7 @@ async def _send_one(phone: str, text: str):
 
 async def _send_messages(messages):
     results = []
+
     for msg in messages:
         phone = (msg.get("phone") or "").strip()
         text = (msg.get("message") or "").strip()
@@ -89,7 +120,13 @@ async def _send_messages(messages):
         if len(text) > 3500:
             text = text[:3500]
 
-        res = await _send_one(phone, text)
+        try:
+            res = await _send_one(phone, text)
+        except asyncio.TimeoutError:
+            res = {"phone": phone, "status": "error", "reason": "telethon_stage_timeout"}
+        except Exception as e:
+            res = {"phone": phone, "status": "error", "reason": f"server_exception: {e}"}
+
         results.append(res)
 
         if res.get("status") == "flood_wait":
@@ -118,7 +155,7 @@ def send_message():
 
         fut = asyncio.run_coroutine_threadsafe(_send_messages(messages), _loop)
 
-        # Держим запрос разумно (чтобы GAS мог ретраить)
+        # максимум 40 секунд на HTTP (чтобы GAS мог ретраить)
         results = fut.result(timeout=40)
 
         all_ok = len(results) > 0 and all(r.get("status") == "ok" for r in results)
