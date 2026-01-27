@@ -1,5 +1,6 @@
 import os
 import asyncio
+import threading
 from flask import Flask, request, jsonify
 
 from telethon import TelegramClient
@@ -15,31 +16,33 @@ API_HASH = os.environ.get("API_HASH", "61bac300978d7a52ce2743969aa72332")
 TG_SESSION = os.environ.get("TG_SESSION", "")
 
 if not TG_SESSION:
-    raise RuntimeError("TG_SESSION is missing in env variables")
+    raise RuntimeError("TG_SESSION is missing in env vars")
 
 client = TelegramClient(StringSession(TG_SESSION), API_ID, API_HASH)
 
-# отдельный loop в фоне
+# --- ВАЖНО: loop должен крутиться постоянно ---
 _loop = asyncio.new_event_loop()
-asyncio.set_event_loop(_loop)
+
+def _run_loop_forever():
+    asyncio.set_event_loop(_loop)
+    _loop.run_forever()
+
+_thread = threading.Thread(target=_run_loop_forever, daemon=True)
+_thread.start()
 
 
-async def _init():
+async def _init_client():
     await client.connect()
-    if not await client.is_user_authorized():
-        raise RuntimeError("Telethon session not authorized (TG_SESSION wrong/expired)")
+    ok = await client.is_user_authorized()
+    if not ok:
+        raise RuntimeError("Telethon session is not authorized (TG_SESSION wrong/expired)")
     return True
 
-
-_loop.run_until_complete(_init())
+# инициализация клиента на работающем loop
+asyncio.run_coroutine_threadsafe(_init_client(), _loop).result(timeout=30)
 
 
 async def _resolve_entity_by_phone(phone: str):
-    """
-    Пытаемся заставить Telegram узнать номер:
-    1) импортируем контакт
-    2) если импорт вернул users -> берем первого
-    """
     phone_clean = phone.replace(" ", "")
     contact = InputPhoneContact(
         client_id=0,
@@ -48,18 +51,19 @@ async def _resolve_entity_by_phone(phone: str):
         last_name="Contact"
     )
     result = await client(ImportContactsRequest([contact]))
-
     if result.users:
         return result.users[0]
-
     return None
 
 
 async def _send_one(phone: str, text: str):
-    # 1) пробуем entity через импорт контакта
     entity = await _resolve_entity_by_phone(phone)
     if not entity:
-        return {"phone": phone, "status": "error", "reason": "Telegram cannot resolve this phone (user may not exist / privacy / not in Telegram)"}
+        return {
+            "phone": phone,
+            "status": "error",
+            "reason": "Telegram cannot resolve this phone (no TG / privacy / cannot message first)"
+        }
 
     try:
         await client.send_message(entity, text)
@@ -82,18 +86,15 @@ async def _send_messages(messages):
             results.append({"phone": phone, "status": "error", "reason": "Missing phone or message"})
             continue
 
-        # ограничим текст, чтобы не словить неожиданные лимиты
         if len(text) > 3500:
             text = text[:3500]
 
         res = await _send_one(phone, text)
         results.append(res)
 
-        # если flood_wait — реально подождём, чтобы следующая отправка не убилась
         if res.get("status") == "flood_wait":
             await asyncio.sleep(int(res.get("retry_after", 60)))
 
-        # маленькая пауза между сообщениями
         await asyncio.sleep(0.3)
 
     return results
@@ -115,9 +116,10 @@ def send_message():
         if not messages:
             return jsonify({"status": "error", "reason": "No messages provided"}), 400
 
-        # ВАЖНО: не держим воркер долго. максимум 25 секунд на запрос.
         fut = asyncio.run_coroutine_threadsafe(_send_messages(messages), _loop)
-        results = fut.result(timeout=25)
+
+        # Держим запрос разумно (чтобы GAS мог ретраить)
+        results = fut.result(timeout=40)
 
         all_ok = len(results) > 0 and all(r.get("status") == "ok" for r in results)
         status = "ok" if all_ok else "partial"
@@ -125,7 +127,6 @@ def send_message():
         return jsonify({"status": status, "results": results}), 200
 
     except asyncio.TimeoutError:
-        # чтобы gunicorn не убивал воркер — вернём норм ответ и GAS решит retry
         return jsonify({"status": "error", "reason": "timeout"}), 504
 
     except Exception as e:
