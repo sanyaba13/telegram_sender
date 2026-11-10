@@ -5,7 +5,7 @@ from urllib.parse import urlsplit
 
 from flask import Flask, jsonify, request
 from telethon import TelegramClient, errors, utils
-from telethon.tl.types import InputMediaPhotoExternal
+from telethon.tl.types import InputMediaDocumentExternal, InputMediaPhotoExternal
 
 
 # Set these in Render -> Environment, using your existing values.
@@ -63,10 +63,25 @@ async def send_batch(messages):
                     if parsed.scheme not in ("http", "https") or not parsed.hostname:
                         raise ValueError("photo_url must be an HTTP(S) URL")
 
-                    # Telegram fetches the image. The URL is not in the caption.
+                    # GIF/video must not go through Telegram's static photo path.
+                    # Ignore query parameters and case when checking the suffix.
+                    # URLs without a suffix can explicitly supply media_type.
+                    media_type = msg.get("media_type", "auto")
+                    if media_type not in ("auto", "photo", "animation", "video"):
+                        raise ValueError("Unsupported media_type")
+                    is_moving_media = media_type in ("animation", "video") or (
+                        media_type == "auto"
+                        and parsed.path.lower().endswith((".gif", ".mp4", ".webm"))
+                    )
+                    media = (
+                        InputMediaDocumentExternal(url=photo_url)
+                        if is_moving_media
+                        else InputMediaPhotoExternal(url=photo_url)
+                    )
+                    # Telegram fetches the original media. The URL stays hidden.
                     sent = await client.send_file(
                         phone.strip(),
-                        InputMediaPhotoExternal(url=photo_url),
+                        media,
                         caption=text,
                         parse_mode=parse_mode,
                         force_document=False,
